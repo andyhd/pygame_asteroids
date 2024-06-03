@@ -10,6 +10,7 @@ from typing import Any
 from typing import Callable
 from typing import ClassVar
 from typing import Iterable
+from typing import NamedTuple
 
 import pygame
 import pygame.locals as pg
@@ -26,11 +27,7 @@ from pygskin.text import Text
 from pygskin.utils import angle_between
 from pygskin.window import Window
 
-WIDTH, HEIGHT = 800, 800
-
 assets = Assets()
-
-Points = list[tuple[float, float]]
 
 
 class Settings:
@@ -39,36 +36,9 @@ class Settings:
     mute: bool = False
 
 
-def translate(v: pygame.Vector2) -> pygame.Vector2:
-    """Translate a vector from 0-1 space to screen space."""
-    return round(v.elementwise() * (WIDTH, HEIGHT))
-
-
-def radial_point(origin: pygame.Vector2, radius: float, angle: float) -> pygame.Vector2:
-    """Return a point on a circle given an origin, radius, and angle."""
-    return origin + pygame.Vector2(0, radius).rotate(angle)
-
-
 def random_vector(magnitude: float = 1.0) -> pygame.Vector2:
     """Return a random vector with a magnitude of 1."""
     return pygame.Vector2(0, 1).rotate(random.random() * 360) * magnitude
-
-
-def draw_radial_points(
-    surface: pygame.Surface,
-    color: pygame.Color,
-    points: Points,
-    pos: pygame.Vector2 = pygame.Vector2(0),
-    radius: float = 1.0,
-    angle: float = 0.0,
-) -> None:
-    """Draw a polygon of points around a center point."""
-    pygame.draw.polygon(
-        surface,
-        color,
-        [translate(radial_point(pos, radius * r, angle + phi)) for r, phi in points],
-        width=1,
-    )
 
 
 def collide(a: Mob, b: Mob) -> bool:
@@ -76,6 +46,69 @@ def collide(a: Mob, b: Mob) -> bool:
     if not (a.alive and b.alive):
         return False
     return a.pos.distance_to(b.pos) < (a.radius + b.radius)
+
+
+class Circle(NamedTuple):
+    """A circle shape."""
+
+    radius: float = 1.0
+    center: pygame.Vector2 = pygame.Vector2()
+
+
+class Polygon(NamedTuple):
+    """A polygon shape."""
+
+    points: list[tuple[float, float]]
+    center: pygame.Vector2 = pygame.Vector2()
+
+
+class ComplexShape(NamedTuple):
+    """A complex shape."""
+
+    parts: list[Polygon]
+    center: pygame.Vector2 = pygame.Vector2()
+
+
+Shape = Circle | Polygon | ComplexShape
+
+
+class Transform(NamedTuple):
+    """Transform a shape."""
+
+    translate: pygame.Vector2 = pygame.Vector2()
+    scale: float = 1.0
+    angle: float = 0.0
+
+    def __call__(self, obj):
+        match obj:
+            case ComplexShape(parts, center):
+                return ComplexShape([self(p) for p in parts], center + self.translate)
+            case Polygon(points, center):
+                return Polygon([self(p) for p in points], center + self.translate)
+            case Circle(radius, center):
+                return Circle(radius * self.scale, center + self.translate)
+            case (r, phi):
+                return (r * self.scale, phi + self.angle)
+            case float(r):
+                return r * self.scale
+
+
+def draw_shape(surface: pygame.Surface, color: pygame.Color, shape: Shape) -> None:
+    """Draw a shape."""
+    width, height = screen_size = surface.get_size()
+    match shape:
+        case Circle(radius, center):
+            center = round(center.elementwise() * screen_size)
+            pygame.draw.circle(surface, color, center, radius * width, width=1)
+        case Polygon(points, center):
+            points = [
+                (center + pygame.Vector2(0, r).rotate(a)).elementwise() * screen_size
+                for r, a in points
+            ]
+            pygame.draw.polygon(surface, color, points, width=1)
+        case ComplexShape(parts, center):
+            for part in parts:
+                draw_shape(surface, color, part)
 
 
 @dataclass
@@ -110,13 +143,14 @@ class Mob:
     """A mobile object with position, velocity, and acceleration."""
 
     pos: pygame.Vector2
+    radius: float = 0.1
     velocity: pygame.Vector2 = field(default_factory=pygame.Vector2)
     acceleration: pygame.Vector2 = field(default_factory=pygame.Vector2)
     angle: float = 0.0
     spin: float = 0.0
-    radius: float = 0.1
     alive: bool = True
     color = pygame.Color("white")
+    shape: Shape = Circle()
 
 
 @dataclass
@@ -138,21 +172,13 @@ class Ship(Mob):
     FULL_SHIELD_COLOR = pygame.Color(255, 255, 255, 255)
     LOW_SHIELD_COLOR = pygame.Color(255, 255, 255, 64)
 
-    FUSELAGE: ClassVar[Points] = [(1, 0), (1, -150), (1, 150)]
-    WINGS: ClassVar[Points] = [(0, 0), (1.2, -120), (1, -150), (1, 150), (1.2, 120)]
-    EXHAUST: ClassVar[Points] = [(1, -150), (1.2, -180), (1, 150)]
-
-    def respawn(self) -> None:
-        """Reset the ship's position and state."""
-        self.pos.update(0.5, 0.5)
-        self.velocity.update(0, 0)
-        self.acceleration.update(0, 0)
-        self.spin = 0.0
-        self.thruster = False
-        self.shield.active = False
-        self.alive = True
-        self.shield.remaining = self.shield.duration
-        self.invulnerability.start()
+    shape: Shape = ComplexShape(
+        [
+            Polygon([(1, 0), (1, -150), (1, 150)]),
+            Polygon([(0, 0), (1.2, -120), (1, -150), (1, 150), (1.2, 120)]),
+        ],
+    )
+    exhaust = Polygon([(1, -150), (1.2, -180), (1, 150)])
 
 
 class Size(IntEnum):
@@ -178,11 +204,13 @@ class Saucer(Mob):
     score: int = 200
     firing_cooldown: Cooldown = field(default_factory=lambda: Cooldown(3000))
 
-    SECTIONS: ClassVar[list[Points]] = [
-        [(1, 90), (0.5, 45), (0.5, -45), (1, -90)],
-        [(1, 90), (0.5, 135), (0.5, -135), (1, -90)],
-        [(0.5, 135), (0.75, 160), (0.75, -160), (0.5, -135)],
-    ]
+    shape: Shape = ComplexShape(
+        [
+            Polygon([(1, 90), (0.5, 45), (0.5, -45), (1, -90)]),
+            Polygon([(1, 90), (0.5, 135), (0.5, -135), (1, -90)]),
+            Polygon([(0.5, 135), (0.75, 160), (0.75, -160), (0.5, -135)]),
+        ],
+    )
 
     def __post_init__(self) -> None:
         self.pos = pygame.Vector2(random.choice((0, 1)), random.uniform(0.1, 0.9))
@@ -207,6 +235,7 @@ class Bullet(Mob):
     radius: float = 0.005
     ttl: Cooldown = field(default_factory=lambda: Cooldown(1000))
     color = pygame.Color("orange")
+    shape: Shape = Circle()
 
     SPEED = 0.15
 
@@ -227,10 +256,12 @@ class Explosion(Mob):
     """An explosion effect with a growing radius."""
 
     size: Size = Size.big
+    radius: float = 0.375
     color = pygame.Color("orange")
     anim: Player = field(
-        default_factory=lambda: Player(KeyframeAnimation({0: 0.0, 200: 0.375}))
+        default_factory=lambda: Player(KeyframeAnimation({0: 0.0, 200: 1.0}))
     )
+    shape: Shape = Circle()
 
     def __post_init__(self) -> None:
         self.anim.send("start")
@@ -244,11 +275,6 @@ class Asteroid(Mob):
 
     size: Size = Size.big
     spin: float = field(default_factory=lambda: random.uniform(-10, 10))
-    points: Points = field(
-        default_factory=lambda: [
-            pygame.Vector2(random.uniform(0.8, 1), i * 18) for i in range(20)
-        ]
-    )
 
     def __post_init__(self) -> None:
         self.radius, speed, self.score, self.num_fragments = {
@@ -260,6 +286,7 @@ class Asteroid(Mob):
             random.uniform(-speed, speed),
             random.uniform(-speed, speed),
         )
+        self.shape = Polygon([(random.uniform(0.8, 1), i * 18) for i in range(20)])
 
 
 @dataclass
@@ -268,8 +295,9 @@ class Drone(Mob):
 
     size: Size = Size.big
     color = pygame.Color("lightblue")
-
-    SEGMENT: ClassVar[Points] = [(1, 0), (1, -120), (0.1, 180), (1, 120)]
+    angle: float = random.random() * 360
+    velocity: pygame.Vector2 = field(default_factory=lambda: random_vector(0.01))
+    shape: Shape = Polygon([(1, 0), (1, -120), (0.1, 180), (1, 120)])
     THRUST_VECTOR = pygame.Vector2(0, 0.0075)
 
     def __post_init__(self) -> None:
@@ -278,9 +306,6 @@ class Drone(Mob):
             Size.medium: (0.04, 0.0125, 0, 2),
             Size.small: (0.025, 0.0175, 200, 0),
         }[self.size]
-        self.velocity = pygame.Vector2(0, self.speed).rotate(random.random() * 360)
-        if self.size != Size.big:
-            self.angle = random.random() * 360
 
 
 @dataclass
@@ -344,12 +369,10 @@ class Lives:
     def draw(self, surface: pygame.Surface) -> None:
         """Draw the remaining lives as ships."""
         for i in range(self.value_fn()):
-            self.draw_ship(surface, pygame.Vector2(0.06 + (i * 0.05), 0.1))
-
-    def draw_ship(self, surface: pygame.Surface, pos: pygame.Vector2) -> None:
-        """Draw a ship icon at a given position."""
-        for part in (Ship.FUSELAGE, Ship.WINGS):
-            draw_radial_points(surface, "white", part, pos=pos, radius=0.015, angle=180)
+            pos = Transform(
+                pygame.Vector2(0.06 + (i * 0.05), 0.1), scale=Ship.radius, angle=180
+            )
+            draw_shape(surface, "white", pos(Ship.shape))
 
 
 class World(ecs.Container):
@@ -379,12 +402,6 @@ class World(ecs.Container):
             cull_explosions,
             respawn_ship,
             play_heartbeat,
-            draw_asteroid,
-            draw_bullet,
-            draw_drone,
-            draw_explosion,
-            draw_saucer,
-            draw_ship,
         ]
 
         self.ship = Ship()
@@ -398,12 +415,12 @@ class World(ecs.Container):
         """Iterate over all asteroids and drones."""
         return (mob for mob in self.entities if isinstance(mob, (Asteroid, Drone)))
 
-    def update(self, events: list[Event], surface: pygame.Surface) -> None:
+    def update(self, events: list[Event]) -> None:
         """Update the world state."""
         if any(event.type == pg.KEYDOWN and event.key == pg.K_p for event in events):
             self.paused = not self.paused
         if not self.paused:
-            super().update(events=events, surface=surface, world=self)
+            super().update(events=events, world=self)
 
     def add(self, mobs: Mob | Iterable[Mob]) -> None:
         """Add multiple mobs to the world."""
@@ -449,11 +466,12 @@ class World(ecs.Container):
         return self._wave
 
     @wave.setter
-    def wave(self, value: Wave) -> None:
+    def wave(self, wave: Wave) -> None:
         """Set the current wave of asteroids."""
         self.entities.remove(self._wave)
-        self._wave = value
-        self.entities.append(value)
+        wave.saucer_timer.remaining = self._wave.saucer_timer.remaining
+        self._wave = wave
+        self.entities.append(wave)
 
 
 def any_key_pressed(events: list[Event]) -> bool:
@@ -498,24 +516,13 @@ class Play(Screen):
             "padding": [10],
             "font": assets.Hyperspace.size(40),
         }
-        self.pause_label = Text(
-            "PAUSED",
-            center=translate(pygame.Vector2(0.5, 0.6)),
-            **text_params,
-        )
-        self.get_ready_label = Text(
-            "GET READY",
-            center=translate(pygame.Vector2(0.5, 0.6)),
-            **text_params,
-        )
-        self.game_over_label = Text(
-            "GAME OVER",
-            center=translate(pygame.Vector2(0.5, 0.4)),
-            **text_params,
-        )
+        pos = (0.5 * Window.width, 0.4 * Window.height)
+        self.pause_label = Text("PAUSED", center=pos, **text_params)
+        self.get_ready_label = Text("GET READY", center=pos, **text_params)
+        self.game_over_label = Text("GAME OVER", center=pos, **text_params)
         self.score_label = DynamicLabel(
             lambda: self.world.score,
-            topleft=translate(pygame.Vector2(0.025, 0)),
+            topleft=pygame.Vector2(0.025 * Window.width, 0),
             **text_params,
         )
         self.lives_meter = Lives(lambda: self.world.ship.lives)
@@ -524,8 +531,7 @@ class Play(Screen):
 
     def update(self, events: list[Event]) -> None:
         """Update the game state."""
-        self.surface.blit(assets.background, (0, 0))
-        self.world.update(events, surface=self.surface)
+        self.world.update(events)
         self.game_over = (
             not self.world.ship.alive and not self.world.ship.respawn_timer.remaining
         )
@@ -535,6 +541,10 @@ class Play(Screen):
 
     def draw(self, surface: pygame.Surface) -> None:
         """Draw the game screen."""
+        self.surface.blit(assets.background, (0, 0))
+        for entity in self.world.entities:
+            if isinstance(entity, Mob):
+                draw_mob(entity, self.surface)
         self.score_label.draw(self.surface)
         self.lives_meter.draw(self.surface)
         if self.game_over:
@@ -667,7 +677,15 @@ def collide_saucer_ship(saucer: Saucer, world: World, **_) -> None:
 def respawn_ship(ship: Ship, world: World, **_) -> None:
     """Respawn the ship if it is dead and has lives remaining."""
     if not ship.alive and not ship.respawn_timer.remaining and ship.lives > 0:
-        ship.respawn()
+        ship.pos.update(0.5, 0.5)
+        ship.velocity.update(0, 0)
+        ship.acceleration.update(0, 0)
+        ship.spin = 0.0
+        ship.thruster = False
+        ship.shield.active = False
+        ship.alive = True
+        ship.shield.remaining = ship.shield.duration
+        ship.invulnerability.start()
 
 
 @ecs.System
@@ -703,7 +721,8 @@ def control_ship(ship: Ship, events: list[Event], world: World, **_) -> None:
                 world.add(
                     Bullet(
                         ship.pos,
-                        velocity=radial_point(ship.velocity, Bullet.SPEED, ship.angle),
+                        velocity=ship.velocity
+                        + pygame.Vector2(0, Bullet.SPEED).rotate(ship.angle),
                     )
                 )
             if key == pg.K_s:
@@ -770,7 +789,6 @@ def start_next_wave(wave: Wave, world: World, **_) -> None:
         # avoid spawning on top of ship
         for asteroid in wave.asteroids:
             asteroid.pos += world.ship.pos
-        wave.saucer_timer.start()
 
 
 @ecs.System
@@ -808,124 +826,51 @@ def play_heartbeat(ship: Ship, world: World, **_) -> None:
         ship.heartbeat.start()
 
 
-@ecs.System
-def draw_asteroid(asteroid: Asteroid, surface: pygame.Surface, **_) -> None:
-    """Draw an asteroid."""
-    if asteroid.alive:
-        draw_radial_points(
-            surface,
-            asteroid.color,
-            asteroid.points,
-            pos=asteroid.pos,
-            radius=asteroid.radius,
-            angle=asteroid.angle,
-        )
+def draw_mob(mob: Mob, surface: pygame.Surface) -> None:
+    """Draw a mob."""
+    if mob.alive:
+        to_world = Transform(translate=mob.pos, scale=mob.radius, angle=mob.angle)
 
+        match mob:
+            case Drone(size=Size.medium) as drone:
+                offset = pygame.Vector2(0, 0.013).rotate(drone.angle)
+                front = Transform(translate=offset, scale=0.625)(drone.shape)
+                back = Transform(translate=-offset, scale=0.625, angle=180)(drone.shape)
+                draw_shape(surface, drone.color, to_world(front))
+                draw_shape(surface, drone.color, to_world(back))
 
-@ecs.System
-def draw_bullet(bullet: Bullet, surface: pygame.Surface, **_) -> None:
-    """Draw a bullet."""
-    if bullet.alive:
-        pygame.draw.circle(
-            surface,
-            bullet.color,
-            translate(bullet.pos),
-            radius=bullet.radius * WIDTH,
-            width=0,
-        )
+            case Drone(size=Size.big) as drone:
+                for angle in range(0, 360, 60):
+                    segment = Transform(
+                        translate=pygame.Vector2(0, 0.025).rotate(angle),
+                        scale=drone.radius * 0.5,
+                        angle=angle - (60 if angle % 120 == 0 else -60),
+                    )(drone.shape)
+                    draw_shape(surface, drone.color, Transform(mob.pos)(segment))
 
+            case Explosion() as explosion:
+                explode = Transform(scale=explosion.anim.current_frame)
+                for i in range(3):
+                    blast_wave = explode(Circle(random.uniform(1, 1.1875)))
+                    draw_shape(surface, explosion.color, to_world(blast_wave))
 
-@ecs.System
-def draw_drone(drone: Drone, surface: pygame.Surface, **_) -> None:
-    """Draw a drone."""
-    if drone.alive:
-        if drone.size == Size.small:
-            draw_drone_segment(surface, drone.pos, drone.radius, drone.angle)
-        if drone.size == Size.medium:
-            offset = math.tan(math.radians(50)) * 0.01
-            for a_add in (0, 180):
-                pos = radial_point(drone.pos, offset, drone.angle + a_add)
-                draw_drone_segment(surface, pos, 0.025, drone.angle + a_add)
-        if drone.size == Size.big:
-            for angle in range(0, 360, 60):
-                pos = radial_point(drone.pos, 0.025, angle)
-                angle = angle - (60 if angle % 120 == 0 else -60)
-                draw_drone_segment(surface, pos, 0.025, angle)
+            case Ship() as ship:
+                draw_shape(surface, ship.color, to_world(ship.shape))
 
+                if ship.thruster:
+                    draw_shape(surface, ship.color, to_world(ship.exhaust))
 
-def draw_drone_segment(
-    surface: pygame.Surface, pos: pygame.Vector2, radius: float, angle: float
-) -> None:
-    """Draw a drone segment."""
-    draw_radial_points(
-        surface,
-        Drone.color,
-        Drone.SEGMENT,
-        pos=pos,
-        radius=radius,
-        angle=angle,
-    )
+                if ship.shield.active:
+                    shield_shape = to_world(Circle(random.uniform(1.2, 1.3875)))
+                    draw_shape(surface, ship.shield.color, shield_shape)
 
-
-@ecs.System
-def draw_explosion(explosion: Explosion, surface: pygame.Surface, **_) -> None:
-    """Draw an explosion."""
-    if explosion.alive:
-        radius = explosion.anim.current_frame
-        for i in range(1, 3):
-            pygame.draw.circle(
-                surface,
-                explosion.color,
-                translate(explosion.pos),
-                radius=(radius + i * random.uniform(0.0, 0.00375)) * WIDTH,
-                width=1,
-            )
-
-
-@ecs.System
-def draw_saucer(saucer: Saucer, surface: pygame.Surface, **_) -> None:
-    """Draw a saucer."""
-    if saucer.alive:
-        for section in Saucer.SECTIONS:
-            draw_radial_points(
-                surface, saucer.color, section, pos=saucer.pos, radius=saucer.radius
-            )
-
-
-@ecs.System
-def draw_ship(ship: Ship, surface: pygame.Surface, **_) -> None:
-    """Draw a ship."""
-    if (
-        ship.alive
-        # flash while invulnerable
-        and (ship.invulnerability.remaining // 100) % 3 != 1
-    ):
-        for part in (Ship.FUSELAGE, Ship.WINGS, Ship.EXHAUST):
-            if part is Ship.EXHAUST and not ship.thruster:
-                continue
-            draw_radial_points(
-                surface,
-                ship.color,
-                part,
-                pos=ship.pos,
-                radius=ship.radius,
-                angle=ship.angle,
-            )
-
-        if ship.shield.active:
-            pygame.draw.circle(
-                surface,
-                ship.shield.color,
-                translate(ship.pos),
-                radius=(ship.radius + random.uniform(0, 0.00375)) * WIDTH,
-                width=1,
-            )
+            case _:
+                draw_shape(surface, mob.color, to_world(mob.shape))
 
 
 if __name__ == "__main__":
-    # Settings.mute = True
     Game(
         initial_screen=MainMenu,
-        window_size=(WIDTH, HEIGHT),
+        window_size=(800, 800),
         window_title="Asteroids",
     ).start()
