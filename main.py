@@ -17,9 +17,9 @@ import pygame.locals as pg
 from pygame.event import Event
 
 from pygskin import ecs
-from pygskin.animation import Player, KeyframeAnimation
+from pygskin.animation import Animation, KeyFrames
 from pygskin.assets import Assets
-from pygskin.clock import Clock
+from pygskin.clock import Clock, Timer
 from pygskin.events import EventDispatch
 from pygskin.game import Game
 from pygskin.screen import Screen
@@ -112,19 +112,7 @@ def draw_shape(surface: pygame.Surface, color: pygame.Color, shape: Shape) -> No
 
 
 @dataclass
-class Cooldown:
-    """A cooldown timer that can be started and checked for completion."""
-
-    duration: int
-    remaining: int = 0
-    active: bool = True
-
-    def start(self) -> None:
-        self.remaining = self.duration
-
-
-@dataclass
-class Shield(Cooldown):
+class Shield(Timer):
     """A shield that can be activated and deactivated."""
 
     active: bool = False
@@ -135,7 +123,7 @@ class Shield(Cooldown):
     @property
     def color(self) -> pygame.Color:
         """Return the color of the shield based on its remaining duration."""
-        return Shield.LOW.lerp(Shield.FULL, self.remaining / self.duration)
+        return Shield.FULL.lerp(Shield.LOW, self.quotient)
 
 
 @dataclass
@@ -162,9 +150,9 @@ class Ship(Mob):
     angle: float = 180.0
     shield: Shield = field(default_factory=lambda: Shield(10000))
     thruster: bool = False
-    heartbeat: Cooldown = field(default_factory=lambda: Cooldown(1000))
-    invulnerability: Cooldown = field(default_factory=lambda: Cooldown(2000))
-    respawn_timer: Cooldown = field(default_factory=lambda: Cooldown(3000))
+    heartbeat: Timer = field(default_factory=lambda: Timer(1000))
+    invulnerability: Timer = field(default_factory=lambda: Timer(2000))
+    respawn_timer: Timer = field(default_factory=lambda: Timer(3000))
     lives: int = 3
     extra_life_trigger: int = 1
 
@@ -202,7 +190,7 @@ class Saucer(Mob):
     radius: float = 0.04
     speed: float = 0.015
     score: int = 200
-    firing_cooldown: Cooldown = field(default_factory=lambda: Cooldown(3000))
+    firing_cooldown: Timer = field(default_factory=lambda: Timer(3000))
 
     shape: Shape = ComplexShape(
         [
@@ -233,14 +221,14 @@ class Bullet(Mob):
 
     source: ClassVar[type[Mob]] = Ship
     radius: float = 0.005
-    ttl: Cooldown = field(default_factory=lambda: Cooldown(1000))
+    ttl: Timer = field(default_factory=lambda: Timer(1000))
     color = pygame.Color("orange")
     shape: Shape = Circle()
 
     SPEED = 0.15
 
     def __post_init__(self) -> None:
-        self.ttl.start()
+        self.ttl.elapsed = 0
 
 
 @dataclass
@@ -258,13 +246,12 @@ class Explosion(Mob):
     size: Size = Size.big
     radius: float = 0.375
     color = pygame.Color("orange")
-    anim: Player = field(
-        default_factory=lambda: Player(KeyframeAnimation({0: 0.0, 200: 1.0}))
-    )
+    keyframes = KeyFrames({0.0: 0.0, 1.0: 1.0})
     shape: Shape = Circle()
 
     def __post_init__(self) -> None:
-        self.anim.send("start")
+        self.timer = Timer(200)
+        self.anim = Animation(self.keyframes, self.timer.quotient)
         if not Settings.mute:
             assets[f"bang_{self.size.name}"].play()
 
@@ -316,12 +303,12 @@ class Wave:
     started: bool = False
     asteroids: list[Asteroid | Drone] = field(default_factory=list)
     saucer: Saucer | None = None
-    saucer_timer: Cooldown = field(default_factory=lambda: Cooldown(60000))
-    get_ready_cooldown: Cooldown = field(default_factory=lambda: Cooldown(3000))
+    saucer_timer: Timer = field(default_factory=lambda: Timer(60000))
+    get_ready_cooldown: Timer = field(default_factory=lambda: Timer(3000))
 
     def __post_init__(self) -> None:
-        self.get_ready_cooldown.start()
-        self.saucer_timer.start()
+        self.get_ready_cooldown.elapsed = 0
+        self.saucer_timer.elapsed = 0
 
         self.asteroids.extend(
             Asteroid(random_vector(random.uniform(0.7, 0.9)))
@@ -382,7 +369,7 @@ class World(ecs.Container):
         super().__init__()
 
         self.systems += [
-            update_cooldowns,
+            update_timers,
             EventDispatch(),
             control_ship,
             steer_drone,
@@ -441,13 +428,13 @@ class World(ecs.Container):
                     assets[f"saucer_{saucer.size.name}"].fadeout(200)
                 self.entities.remove(saucer)
                 self.wave.saucer = None
-                self.wave.saucer_timer.start()
+                self.wave.saucer_timer.elapsed = 0
 
             case Ship() as ship:
                 if not Settings.mute:
                     assets.thrust.fadeout(200)
                 ship.lives -= 1
-                ship.respawn_timer.start()
+                ship.respawn_timer.elapsed = 0
 
             case _ as entity:
                 self.entities.remove(entity)
@@ -469,7 +456,7 @@ class World(ecs.Container):
     def wave(self, wave: Wave) -> None:
         """Set the current wave of asteroids."""
         self.entities.remove(self._wave)
-        wave.saucer_timer.remaining = self._wave.saucer_timer.remaining
+        wave.saucer_timer.elapsed = self._wave.saucer_timer.elapsed
         self._wave = wave
         self.entities.append(wave)
 
@@ -498,7 +485,7 @@ class MainMenu(Screen):
         if any_key_pressed(events):
             self.exit()
 
-    def start_game(self) -> type[Play]:
+    def start_game(self, **_) -> type[Play]:
         """Transition to the play screen."""
         return Play
 
@@ -533,7 +520,7 @@ class Play(Screen):
         """Update the game state."""
         self.world.update(events)
         self.game_over = (
-            not self.world.ship.alive and not self.world.ship.respawn_timer.remaining
+            not self.world.ship.alive and self.world.ship.respawn_timer.finished
         )
         if self.game_over and any_key_pressed(events):
             self.world.remove_all()
@@ -551,24 +538,21 @@ class Play(Screen):
             self.surface.blit(self.game_over_label.image, self.game_over_label.rect)
         elif self.world.paused:
             self.surface.blit(self.pause_label.image, self.pause_label.rect)
-        elif self.world.wave.get_ready_cooldown.remaining > 0:
+        elif not self.world.wave.get_ready_cooldown.finished:
             self.surface.blit(self.get_ready_label.image, self.get_ready_label.rect)
         surface.blit(self.surface, (0, 0))
 
-    def back_to_main_menu(self) -> type[MainMenu]:
+    def back_to_main_menu(self, **_) -> type[MainMenu]:
         """Transition back to the main menu screen."""
         return MainMenu
 
 
-@ecs.System
-def update_cooldowns(entity: object, **_) -> None:
-    """Update cooldown timers."""
-    for name, attr in getmembers(entity, lambda attr: isinstance(attr, Cooldown)):
-        if attr.active:
-            attr.remaining = max(0, attr.remaining - Clock.delta_time)
+def update_timers(entity: object, **_) -> None:
+    """Update all timers in an entity."""
+    for name, timer in getmembers(entity, lambda attr: isinstance(attr, Timer)):
+        timer.tick(Clock.delta_time)
 
 
-@ecs.System
 def apply_physics(mob: Mob, **_) -> None:
     """Apply physics to a mob."""
     if not mob.alive:
@@ -581,7 +565,6 @@ def apply_physics(mob: Mob, **_) -> None:
     mob.angle = (mob.angle + mob.spin * delta_time) % 360
 
 
-@ecs.System
 def collide_bullet_asteroid(bullet: Bullet, world: World, **_) -> None:
     """Check for collisions between bullets and asteroids or drones."""
     for asteroid in world.asteroids:
@@ -604,7 +587,6 @@ def get_fragments(mob: Asteroid | Drone) -> list[Asteroid | Drone]:
     ]
 
 
-@ecs.System
 def collide_bullet_saucer(bullet: Bullet, world: World, **_) -> None:
     """Check for collisions between bullets and saucers."""
     if (
@@ -618,7 +600,6 @@ def collide_bullet_saucer(bullet: Bullet, world: World, **_) -> None:
         world.remove(bullet)
 
 
-@ecs.System
 def collide_asteroid_ship(asteroid: Asteroid, world: World, **_) -> None:
     """Check for collisions between asteroids and the ship."""
     ship = world.ship
@@ -626,12 +607,11 @@ def collide_asteroid_ship(asteroid: Asteroid, world: World, **_) -> None:
         if ship.shield.active:
             asteroid.velocity = asteroid.velocity.reflect(asteroid.pos - ship.pos)
             asteroid.pos += asteroid.velocity
-        elif not ship.invulnerability.remaining:
+        elif ship.invulnerability.finished:
             world.add(Explosion(ship.pos.copy()))
             world.remove(ship)
 
 
-@ecs.System
 def collide_drone_ship(drone: Drone, world: World, **_) -> None:
     """Check for collisions between drones and the ship."""
     ship = world.ship
@@ -639,18 +619,17 @@ def collide_drone_ship(drone: Drone, world: World, **_) -> None:
         if ship.shield.active:
             world.add(Explosion(drone.pos.copy(), size=drone.size))
             world.remove(drone)
-        elif not ship.invulnerability.remaining:
+        elif ship.invulnerability.finished:
             world.add(Explosion(ship.pos.copy()))
             world.remove(ship)
 
 
-@ecs.System
 def collide_bullet_ship(bullet: Bullet, world: World, **_) -> None:
     """Check for collisions between bullets and the ship."""
     ship = world.ship
     if (
         ship.alive
-        and not ship.invulnerability.remaining
+        and ship.invulnerability.finished
         and bullet.source is not Ship
         and collide(bullet, ship)
     ):
@@ -660,7 +639,6 @@ def collide_bullet_ship(bullet: Bullet, world: World, **_) -> None:
             world.remove(ship)
 
 
-@ecs.System
 def collide_saucer_ship(saucer: Saucer, world: World, **_) -> None:
     """Check for collisions between saucers and the ship."""
     ship = world.ship
@@ -673,10 +651,9 @@ def collide_saucer_ship(saucer: Saucer, world: World, **_) -> None:
             world.remove(ship)
 
 
-@ecs.System
 def respawn_ship(ship: Ship, world: World, **_) -> None:
     """Respawn the ship if it is dead and has lives remaining."""
-    if not ship.alive and not ship.respawn_timer.remaining and ship.lives > 0:
+    if not ship.alive and ship.respawn_timer.finished and ship.lives > 0:
         ship.pos.update(0.5, 0.5)
         ship.velocity.update(0, 0)
         ship.acceleration.update(0, 0)
@@ -684,21 +661,19 @@ def respawn_ship(ship: Ship, world: World, **_) -> None:
         ship.thruster = False
         ship.shield.active = False
         ship.alive = True
-        ship.shield.remaining = ship.shield.duration
-        ship.invulnerability.start()
+        ship.shield.elapsed = 0
+        ship.invulnerability.elapsed = 0
 
 
-@ecs.System
 def spawn_saucer(wave: Wave, world: World, **_) -> None:
     """Spawn a saucer if the timer has elapsed."""
-    if not wave.saucer and wave.saucer_timer.remaining <= 0:
+    if not wave.saucer and wave.saucer_timer.finished:
         wave.saucer = random.choice((Saucer, SmallSaucer))()
         world.add(wave.saucer)
         if not Settings.mute:
             assets[f"saucer_{wave.saucer.size.name}"].play(loops=-1, fade_ms=100)
 
 
-@ecs.System
 def control_ship(ship: Ship, events: list[Event], world: World, **_) -> None:
     """Control the ship with keyboard input."""
     if not ship.alive:
@@ -744,7 +719,6 @@ def control_ship(ship: Ship, events: list[Event], world: World, **_) -> None:
         ship.acceleration = Ship.THRUST_VECTOR.rotate(ship.angle)
 
 
-@ecs.System
 def steer_drone(drone: Drone, world: World, **_) -> None:
     """Steer the drone towards the ship."""
     if drone.size != Size.big:
@@ -754,16 +728,14 @@ def steer_drone(drone: Drone, world: World, **_) -> None:
         drone.velocity.clamp_magnitude_ip(drone.speed)
 
 
-@ecs.System
 def steer_saucer(saucer: Saucer, **_) -> None:
     """Steer the saucer in a sine wave pattern."""
     saucer.velocity.y = math.sin(math.radians(saucer.pos.x * 360 * 3)) * 0.015
 
 
-@ecs.System
 def shoot_saucer(saucer: Saucer, world: World, **_) -> None:
     """Shoot a bullet from the saucer."""
-    if saucer.firing_cooldown.remaining <= 0:
+    if saucer.firing_cooldown.finished:
         if saucer.size == Size.big:
             velocity = saucer.velocity + random_vector(Bullet.SPEED)
         else:
@@ -774,16 +746,15 @@ def shoot_saucer(saucer: Saucer, world: World, **_) -> None:
         world.add(SaucerBullet(saucer.pos, velocity=velocity))
         if not Settings.mute:
             assets.saucer_fire.play()
-        saucer.firing_cooldown.start()
+        saucer.firing_cooldown.elapsed = 0
 
 
-@ecs.System
 def start_next_wave(wave: Wave, world: World, **_) -> None:
     """Start the next wave when all asteroids are destroyed."""
     if wave.completed:
         world.wave = Wave(wave.number + 1)
 
-    if not wave.started and not wave.get_ready_cooldown.remaining:
+    if not wave.started and wave.get_ready_cooldown.finished:
         wave.started = True
         world.add(wave.asteroids)
         # avoid spawning on top of ship
@@ -791,21 +762,18 @@ def start_next_wave(wave: Wave, world: World, **_) -> None:
             asteroid.pos += world.ship.pos
 
 
-@ecs.System
 def cull_bullets(bullet: Bullet, world: World, **_) -> None:
     """Remove bullets that have exceeded their time-to-live."""
-    if not bullet.ttl.remaining:
+    if bullet.ttl.finished:
         world.remove(bullet)
 
 
-@ecs.System
 def cull_explosions(explosion: Explosion, world: World, **_) -> None:
     """Remove explosions that have completed their animation."""
-    if explosion.anim.elapsed >= explosion.anim.duration:
+    if explosion.timer.finished:
         world.remove(explosion)
 
 
-@ecs.System
 def award_extra_lives(ship: Ship, world: World, **_) -> None:
     """Award an extra life every 10,000 points."""
     if world.score > ship.extra_life_trigger * 10000:
@@ -816,14 +784,13 @@ def award_extra_lives(ship: Ship, world: World, **_) -> None:
         ship.extra_life_trigger += 1
 
 
-@ecs.System
 def play_heartbeat(ship: Ship, world: World, **_) -> None:
     """Play the heartbeat sound effect at regular intervals."""
-    if not ship.heartbeat.remaining:
+    if ship.heartbeat.finished:
         if not Settings.mute:
             assets.beat1.play()
         ship.heartbeat.duration = 1000 + int(min(1.0, world.score / 1000000) * 750)
-        ship.heartbeat.start()
+        ship.heartbeat.elapsed = 0
 
 
 def draw_mob(mob: Mob, surface: pygame.Surface) -> None:
