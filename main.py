@@ -1,39 +1,174 @@
-from __future__ import annotations
-
 import math
 import random
-from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from dataclasses import field
 from enum import IntEnum
+from functools import cache
+from functools import partial
 from inspect import getmembers
 from typing import Any
-from typing import Callable
-from typing import ClassVar
-from typing import Iterable
-from typing import NamedTuple
+from typing import cast
 
 import pygame
 import pygame.locals as pg
 from pygame.event import Event
 
-from pygskin import ecs
-from pygskin.animation import Animation, KeyFrames
+from pygskin import imgui
+from pygskin.animation import animate
 from pygskin.assets import Assets
-from pygskin.clock import Clock, Timer
-from pygskin.events import EventDispatch
-from pygskin.game import Game
-from pygskin.screen import Screen
-from pygskin.text import Text
+from pygskin.clock import Clock
+from pygskin.clock import Timer
+from pygskin.ecs import get_ecs_update_fn
+from pygskin.game import run_game
+from pygskin.imgui import label
+from pygskin.screen import ScreenFn
+from pygskin.screen import screen_manager
+from pygskin.stylesheet import get_styles
 from pygskin.utils import angle_between
-from pygskin.window import Window
+
+from shapes import Circle
+from shapes import ComplexShape
+from shapes import Polygon
+from shapes import Shape
+from shapes import draw_shape
+from shapes import transform
+
 
 assets = Assets()
+stylesheet = partial(
+    get_styles,
+    {
+        "*": {
+            "color": "white",
+            "font": assets.Hyperspace.size(40),
+            "padding": [10],
+        },
+    },
+)
+gui = imgui.IMGUI()
 
 
-class Settings:
-    """Game settings."""
+def asteroids():
+    return screen_manager(
+        {
+            main_menu: [start_game],
+            play_game(): [return_to_main_menu],
+        }
+    )
 
-    mute: bool = False
+
+def main_menu(window: pygame.Window, events: list[Event], state: dict) -> None:
+    """The main menu screen."""
+    surface = window.get_surface()
+    rect = surface.get_rect()
+    surface.blit(assets.main_menu, (0, 0))
+
+    with imgui.render(gui, surface, stylesheet) as render:
+        render(
+            label("Press any key to start"),
+            centerx=rect.centerx,
+            y=rect.bottom - 100,
+        )
+
+    if any(event.type == pg.KEYDOWN for event in events):
+        state["start_game"] = True
+
+
+def start_game(state) -> ScreenFn | None:
+    return play_game() if state.pop("start_game", False) else None
+
+
+@cache
+def play_game() -> ScreenFn:
+    state: dict[str, Any] = {}
+    entities: list[Any] = []
+    ship = Ship()
+    wave = Wave(0)
+
+    ecs_update = get_ecs_update_fn(
+        [
+            update_timers,
+            control_ship,
+            steer_drone,
+            steer_saucer,
+            shoot_saucer,
+            start_next_wave,
+            apply_physics,
+            collide_bullet_asteroid,
+            collide_bullet_saucer,
+            collide_asteroid_ship,
+            collide_drone_ship,
+            collide_bullet_ship,
+            collide_saucer_ship,
+            award_extra_lives,
+            spawn_saucer,
+            timeout_bullets,
+            timeout_explosions,
+            respawn_ship,
+            play_heartbeat,
+        ]
+    )
+
+    def reset_game():
+        state["game_over"] = False
+        state["paused"] = False
+        state["ship"] = ship
+        state["wave"] = wave
+        entities.clear()
+        entities.append(ship)
+        entities.append(wave)
+        ship.score = 0
+        ship.lives = 3
+        respawn_ship(ship, [])
+        wave.number = 0
+        wave.__post_init__()
+
+    reset_game()
+
+    def _play_game(window: pygame.Window, events: list[Event], s: dict) -> None:
+        """The main game screen."""
+        surface = window.get_surface()
+        surface.fill((0, 0, 0))
+        surface.blit(assets.background, (0, 0))
+        rect = surface.get_rect()
+        layer = pygame.Surface(rect.size, pygame.SRCALPHA)
+        state.setdefault("screen_manager", s["screen_manager"])
+
+        if any(event.type == pg.KEYDOWN and event.key == pg.K_p for event in events):
+            state["paused"] = not state["paused"]
+
+        if not state["paused"]:
+            ecs_update(entities, events=events, state=state)
+
+        state["game_over"] = not ship.alive and ship.respawn_timer.finished
+        if state["game_over"] and any(event.type == pg.KEYDOWN for event in events):
+            entities.clear()
+            reset_game()
+            state["screen_manager"].send(state)
+
+        for entity in entities:
+            if isinstance(entity, Mob) and entity.alive:
+                draw_mob(surface, entity)
+
+        draw_lives(layer, ship.lives)
+        with imgui.render(gui, layer, stylesheet) as render:
+            render(label(f"{ship.score:7d}"), topleft=(0.025 * rect.width, 0))
+            if state["game_over"]:
+                render(label("GAME OVER"), center=rect.center)
+            elif state["paused"]:
+                render(label("PAUSED"), center=rect.center)
+            elif not wave.get_ready_cooldown.finished:
+                render(label("GET READY"), center=rect.center)
+
+        surface.blit(layer, (0, 0))
+
+    return _play_game
+
+
+def return_to_main_menu(state) -> ScreenFn | None:
+    if state.get("game_over"):
+        return main_menu
+    return None
 
 
 def random_vector(magnitude: float = 1.0) -> pygame.Vector2:
@@ -41,89 +176,19 @@ def random_vector(magnitude: float = 1.0) -> pygame.Vector2:
     return pygame.Vector2(0, 1).rotate(random.random() * 360) * magnitude
 
 
-def collide(a: Mob, b: Mob) -> bool:
-    """Check if two mobs are colliding."""
-    if not (a.alive and b.alive):
-        return False
-    return a.pos.distance_to(b.pos) < (a.radius + b.radius)
+# @dataclass
+# class Shield(Timer):
+#     """A shield that can be activated and deactivated."""
 
+#     active: bool = False
 
-class Circle(NamedTuple):
-    """A circle shape."""
+#     FULL = pygame.Color(255, 255, 255, 255)
+#     LOW = pygame.Color(255, 255, 255, 64)
 
-    radius: float = 1.0
-    center: pygame.Vector2 = pygame.Vector2()
-
-
-class Polygon(NamedTuple):
-    """A polygon shape."""
-
-    points: list[tuple[float, float]]
-    center: pygame.Vector2 = pygame.Vector2()
-
-
-class ComplexShape(NamedTuple):
-    """A complex shape."""
-
-    parts: list[Polygon]
-    center: pygame.Vector2 = pygame.Vector2()
-
-
-Shape = Circle | Polygon | ComplexShape
-
-
-class Transform(NamedTuple):
-    """Transform a shape."""
-
-    translate: pygame.Vector2 = pygame.Vector2()
-    scale: float = 1.0
-    angle: float = 0.0
-
-    def __call__(self, obj):
-        match obj:
-            case ComplexShape(parts, center):
-                return ComplexShape([self(p) for p in parts], center + self.translate)
-            case Polygon(points, center):
-                return Polygon([self(p) for p in points], center + self.translate)
-            case Circle(radius, center):
-                return Circle(radius * self.scale, center + self.translate)
-            case (r, phi):
-                return (r * self.scale, phi + self.angle)
-            case float(r):
-                return r * self.scale
-
-
-def draw_shape(surface: pygame.Surface, color: pygame.Color, shape: Shape) -> None:
-    """Draw a shape."""
-    width, height = screen_size = surface.get_size()
-    match shape:
-        case Circle(radius, center):
-            center = round(center.elementwise() * screen_size)
-            pygame.draw.circle(surface, color, center, radius * width, width=1)
-        case Polygon(points, center):
-            points = [
-                (center + pygame.Vector2(0, r).rotate(a)).elementwise() * screen_size
-                for r, a in points
-            ]
-            pygame.draw.polygon(surface, color, points, width=1)
-        case ComplexShape(parts, center):
-            for part in parts:
-                draw_shape(surface, color, part)
-
-
-@dataclass
-class Shield(Timer):
-    """A shield that can be activated and deactivated."""
-
-    active: bool = False
-
-    FULL = pygame.Color(255, 255, 255, 255)
-    LOW = pygame.Color(255, 255, 255, 64)
-
-    @property
-    def color(self) -> pygame.Color:
-        """Return the color of the shield based on its remaining duration."""
-        return Shield.FULL.lerp(Shield.LOW, self.quotient)
+#     @property
+#     def color(self) -> pygame.Color:
+#         """Return the color of the shield based on its remaining duration."""
+#         return Shield.FULL.lerp(Shield.LOW, self.quotient)
 
 
 @dataclass
@@ -141,6 +206,13 @@ class Mob:
     shape: Shape = Circle()
 
 
+def collide(a: Mob, b: Mob) -> bool:
+    """Check if two mobs are colliding."""
+    if not (a.alive and b.alive):
+        return False
+    return a.pos.distance_to(b.pos) < (a.radius + b.radius)
+
+
 @dataclass
 class Ship(Mob):
     """A player-controlled ship with additional properties."""
@@ -148,12 +220,13 @@ class Ship(Mob):
     pos: pygame.Vector2 = field(default_factory=lambda: pygame.Vector2(0.5))
     radius: float = 0.02
     angle: float = 180.0
-    shield: Shield = field(default_factory=lambda: Shield(10000))
+    # shield: Shield = field(default_factory=lambda: Shield(10000))
     thruster: bool = False
     heartbeat: Timer = field(default_factory=lambda: Timer(1000))
     invulnerability: Timer = field(default_factory=lambda: Timer(2000))
-    respawn_timer: Timer = field(default_factory=lambda: Timer(3000))
+    respawn_timer: Timer = field(default_factory=lambda: Timer(3000, paused=True))
     lives: int = 3
+    score: int = 0
     extra_life_trigger: int = 1
 
     THRUST_VECTOR = pygame.Vector2(0, 0.005)
@@ -172,13 +245,13 @@ class Ship(Mob):
 class Size(IntEnum):
     """An enumeration of mob sizes."""
 
-    big = 0
+    big = 2
     medium = 1
-    small = 2
+    small = 0
 
-    def smaller(self) -> Size:
+    def smaller(self) -> "Size":
         """Return the next smaller size."""
-        return Size(self.value + 1)
+        return Size(self.value - 1)
 
 
 @dataclass
@@ -186,11 +259,9 @@ class Saucer(Mob):
     """An enemy saucer with additional properties."""
 
     pos: pygame.Vector2 = field(default_factory=pygame.Vector2)
-    size: ClassVar[Size] = Size.big
-    radius: float = 0.04
-    speed: float = 0.015
-    score: int = 200
+    size: Size = Size.big
     firing_cooldown: Timer = field(default_factory=lambda: Timer(3000))
+    color = pygame.Color("green")
 
     shape: Shape = ComplexShape(
         [
@@ -201,59 +272,50 @@ class Saucer(Mob):
     )
 
     def __post_init__(self) -> None:
+        self.radius, speed, self.score = {
+            Size.big: (0.04, 0.015, 200),
+            Size.small: (0.025, 0.01, 1000),
+        }[self.size]
         self.pos = pygame.Vector2(random.choice((0, 1)), random.uniform(0.1, 0.9))
-        self.velocity = pygame.Vector2(math.copysign(self.speed, self.pos.x - 0.5), 0)
-
-
-@dataclass
-class SmallSaucer(Saucer):
-    """A smaller variant of the saucer."""
-
-    size: ClassVar[Size] = Size.small
-    radius: float = 0.025
-    speed: float = 0.01
-    score: int = 1000
+        self.velocity = pygame.Vector2(math.copysign(speed, self.pos.x - 0.5), 0)
 
 
 @dataclass
 class Bullet(Mob):
     """A projectile fired by a ship."""
 
-    source: ClassVar[type[Mob]] = Ship
+    source: Mob | None = None
     radius: float = 0.005
     ttl: Timer = field(default_factory=lambda: Timer(1000))
     color = pygame.Color("orange")
-    shape: Shape = Circle()
 
     SPEED = 0.15
 
     def __post_init__(self) -> None:
         self.ttl.elapsed = 0
+        if isinstance(self.source, Saucer):
+            self.color = pygame.Color("greenyellow")
 
 
-@dataclass
-class SaucerBullet(Bullet):
-    """A projectile fired by a saucer."""
-
-    source: ClassVar[type[Mob]] = Saucer
-    color = pygame.Color("greenyellow")
-
-
-@dataclass
 class Explosion(Mob):
     """An explosion effect with a growing radius."""
 
-    size: Size = Size.big
-    radius: float = 0.375
-    color = pygame.Color("orange")
-    keyframes = KeyFrames({0.0: 0.0, 1.0: 1.0})
-    shape: Shape = Circle()
-
-    def __post_init__(self) -> None:
+    def __init__(self, pos: pygame.Vector2, size: Size = Size.big) -> None:
+        super().__init__(pos)
+        self.size = size
         self.timer = Timer(200)
-        self.anim = Animation(self.keyframes, self.timer.quotient)
-        if not Settings.mute:
-            assets[f"bang_{self.size.name}"].play()
+        self._radius = animate({0.0: 0.0, 1.0: 0.375}, self.timer.quotient)
+        self.color = pygame.Color("orange")
+
+        assets[f"bang_{self.size.name}"].play()
+
+    @property
+    def radius(self) -> float:
+        return next(self._radius)
+
+    @radius.setter
+    def radius(self, value: float) -> None:
+        pass
 
 
 @dataclass
@@ -301,7 +363,7 @@ class Wave:
 
     number: int = 0
     started: bool = False
-    asteroids: list[Asteroid | Drone] = field(default_factory=list)
+    asteroids: list = field(default_factory=list)
     saucer: Saucer | None = None
     saucer_timer: Timer = field(default_factory=lambda: Timer(60000))
     get_ready_cooldown: Timer = field(default_factory=lambda: Timer(3000))
@@ -310,7 +372,7 @@ class Wave:
         self.get_ready_cooldown.elapsed = 0
         self.saucer_timer.elapsed = 0
 
-        self.asteroids.extend(
+        self.asteroids[:] = list(
             Asteroid(random_vector(random.uniform(0.7, 0.9)))
             for _ in range(min(self.number + 3, 6))
         )
@@ -318,246 +380,36 @@ class Wave:
         if self.number > 3:
             self.asteroids.append(Drone(random_vector(random.uniform(0.7, 0.9))))
 
-    def remove(self, mob: Asteroid | Drone) -> None:
-        """Remove an asteroid or drone from the wave."""
-        self.asteroids.remove(mob)
-
     @property
     def completed(self) -> bool:
         """Check if the wave is completed."""
         return self.started and not self.asteroids and not self.saucer
 
 
-class DynamicLabel:
-    """A label that can be updated with a new value."""
-
-    def __init__(self, value_fn: Callable[[], Any], **kwargs) -> None:
-        self.value_fn = value_fn
-        self.value = value_fn()
-        self.label = Text(str(self.value), **kwargs)
-
-    def draw(self, surface: pygame.Surface) -> None:
-        """Draw the label."""
-        if (value := self.value_fn()) != self.value:
-            self.value = value
-            self.label.text = str(value)
-            with suppress(AttributeError):
-                del self.label.image
-                del self.label.rect
-        surface.blit(self.label.image, self.label.rect)
-
-
-class Lives:
-    """Display of remaining lives."""
-
-    def __init__(self, value_fn: Callable[[], int]) -> None:
-        self.value_fn = value_fn
-
-    def draw(self, surface: pygame.Surface) -> None:
-        """Draw the remaining lives as ships."""
-        for i in range(self.value_fn()):
-            pos = Transform(
-                pygame.Vector2(0.06 + (i * 0.05), 0.1), scale=Ship.radius, angle=180
-            )
-            draw_shape(surface, "white", pos(Ship.shape))
-
-
-class World(ecs.Container):
-    """The game world containing all entities and systems."""
-
-    def __init__(self) -> None:
-        super().__init__()
-
-        self.systems += [
-            update_timers,
-            EventDispatch(),
-            control_ship,
-            steer_drone,
-            steer_saucer,
-            shoot_saucer,
-            start_next_wave,
-            apply_physics,
-            collide_bullet_asteroid,
-            collide_bullet_saucer,
-            collide_asteroid_ship,
-            collide_drone_ship,
-            collide_bullet_ship,
-            collide_saucer_ship,
-            award_extra_lives,
-            spawn_saucer,
-            cull_bullets,
-            cull_explosions,
-            respawn_ship,
-            play_heartbeat,
-        ]
-
-        self.ship = Ship()
-        self.add(self.ship)
-
-        self.paused = False
-        self.score = 0
-
-    @property
-    def asteroids(self) -> Iterable[Asteroid | Drone]:
-        """Iterate over all asteroids and drones."""
-        return (mob for mob in self.entities if isinstance(mob, (Asteroid, Drone)))
-
-    def update(self, events: list[Event]) -> None:
-        """Update the world state."""
-        if any(event.type == pg.KEYDOWN and event.key == pg.K_p for event in events):
-            self.paused = not self.paused
-        if not self.paused:
-            super().update(events=events, world=self)
-
-    def add(self, mobs: Mob | Iterable[Mob]) -> None:
-        """Add multiple mobs to the world."""
-        if isinstance(mobs, Mob):
-            mobs = [mobs]
-        self.entities.extend(mobs)
-
-    def remove(self, entity: Any) -> None:
-        """Remove an entity from the world."""
-        entity.alive = False
-        match entity:
-            case (Asteroid() | Drone()) as mob:
-                self.entities.remove(mob)
-                self.wave.remove(mob)
-
-            case Saucer() as saucer:
-                if not Settings.mute:
-                    assets[f"saucer_{saucer.size.name}"].fadeout(200)
-                self.entities.remove(saucer)
-                self.wave.saucer = None
-                self.wave.saucer_timer.elapsed = 0
-
-            case Ship() as ship:
-                if not Settings.mute:
-                    assets.thrust.fadeout(200)
-                ship.lives -= 1
-                ship.respawn_timer.elapsed = 0
-
-            case _ as entity:
-                self.entities.remove(entity)
-
-    def remove_all(self) -> None:
-        """Remove all entities from the world."""
-        for entity in self.entities:
-            self.remove(entity)
-
-    @property
-    def wave(self) -> Wave:
-        """The current wave of asteroids."""
-        if not hasattr(self, "_wave"):
-            self._wave = Wave(0)
-            self.entities.append(self._wave)
-        return self._wave
-
-    @wave.setter
-    def wave(self, wave: Wave) -> None:
-        """Set the current wave of asteroids."""
-        self.entities.remove(self._wave)
-        wave.saucer_timer.elapsed = self._wave.saucer_timer.elapsed
-        self._wave = wave
-        self.entities.append(wave)
-
-
-def any_key_pressed(events: list[Event]) -> bool:
-    """Check if any key was pressed in a list of events."""
-    return any(event.type == pg.KEYDOWN for event in events)
-
-
-class MainMenu(Screen):
-    """The main menu screen."""
-
-    def draw(self, surface: pygame.Surface) -> None:
-        """Draw the main menu screen."""
-        surface.blit(assets.main_menu, (0, 0))
-        prompt = Text(
-            "Press any key to start",
-            font=assets.Hyperspace.size(30),
-            padding=[20],
-            midbottom=surface.get_rect().midbottom,
+def draw_lives(surface: pygame.Surface, lives: int) -> None:
+    """Draw the remaining lives as ships."""
+    for i in range(lives):
+        ship = transform(
+            cast(ComplexShape, Ship.shape),
+            pygame.Vector2(0.06 + (i * 0.05), 0.1),
+            scale=Ship.radius,
+            rotate=180,
         )
-        surface.blit(prompt.image, prompt.rect)
-
-    def update(self, events: list[Event]) -> None:
-        """Update the main menu screen."""
-        if any_key_pressed(events):
-            self.exit()
-
-    def start_game(self, **_) -> type[Play]:
-        """Transition to the play screen."""
-        return Play
-
-
-class Play(Screen):
-    """The main game screen."""
-
-    def setup(self) -> None:
-        """Initialize the game world and labels."""
-        self.world = World()
-        self.surface = pygame.Surface(Window.size).convert_alpha()
-
-        text_params = {
-            "color": "white",
-            "padding": [10],
-            "font": assets.Hyperspace.size(40),
-        }
-        pos = (0.5 * Window.width, 0.4 * Window.height)
-        self.pause_label = Text("PAUSED", center=pos, **text_params)
-        self.get_ready_label = Text("GET READY", center=pos, **text_params)
-        self.game_over_label = Text("GAME OVER", center=pos, **text_params)
-        self.score_label = DynamicLabel(
-            lambda: self.world.score,
-            topleft=pygame.Vector2(0.025 * Window.width, 0),
-            **text_params,
-        )
-        self.lives_meter = Lives(lambda: self.world.ship.lives)
-
-        self.game_over = False
-
-    def update(self, events: list[Event]) -> None:
-        """Update the game state."""
-        self.world.update(events)
-        self.game_over = (
-            not self.world.ship.alive and self.world.ship.respawn_timer.finished
-        )
-        if self.game_over and any_key_pressed(events):
-            self.world.remove_all()
-            self.exit()
-
-    def draw(self, surface: pygame.Surface) -> None:
-        """Draw the game screen."""
-        self.surface.blit(assets.background, (0, 0))
-        for entity in self.world.entities:
-            if isinstance(entity, Mob):
-                draw_mob(entity, self.surface)
-        self.score_label.draw(self.surface)
-        self.lives_meter.draw(self.surface)
-        if self.game_over:
-            self.surface.blit(self.game_over_label.image, self.game_over_label.rect)
-        elif self.world.paused:
-            self.surface.blit(self.pause_label.image, self.pause_label.rect)
-        elif not self.world.wave.get_ready_cooldown.finished:
-            self.surface.blit(self.get_ready_label.image, self.get_ready_label.rect)
-        surface.blit(self.surface, (0, 0))
-
-    def back_to_main_menu(self, **_) -> type[MainMenu]:
-        """Transition back to the main menu screen."""
-        return MainMenu
+        draw_shape(surface, "white", ship)
 
 
 def update_timers(entity: object, **_) -> None:
     """Update all timers in an entity."""
+    delta_time = Clock.get_time()
     for name, timer in getmembers(entity, lambda attr: isinstance(attr, Timer)):
-        timer.tick(Clock.delta_time)
+        timer.tick(delta_time)
 
 
 def apply_physics(mob: Mob, **_) -> None:
     """Apply physics to a mob."""
     if not mob.alive:
         return
-    delta_time = Clock.delta_time / 100
+    delta_time = Clock.get_time() / 100
     mob.velocity = mob.velocity + mob.acceleration * delta_time
     mob.pos += mob.velocity * delta_time
     # wrap around screen
@@ -565,18 +417,23 @@ def apply_physics(mob: Mob, **_) -> None:
     mob.angle = (mob.angle + mob.spin * delta_time) % 360
 
 
-def collide_bullet_asteroid(bullet: Bullet, world: World, **_) -> None:
+def collide_bullet_asteroid(bullet: Bullet, entities: list, state: dict, **_) -> None:
     """Check for collisions between bullets and asteroids or drones."""
-    for asteroid in world.asteroids:
+    if not bullet.alive:
+        return
+    wave = state["wave"]
+    for asteroid in list(wave.asteroids):
         if collide(bullet, asteroid):
-            if bullet.source is Ship:
-                world.score += asteroid.score
-            world.add(Explosion(asteroid.pos.copy(), size=asteroid.size))
+            if isinstance(bullet.source, Ship):
+                bullet.source.score += asteroid.score
+            entities.append(Explosion(asteroid.pos.copy(), size=asteroid.size))
             fragments = get_fragments(asteroid)
-            world.wave.asteroids.extend(fragments)
-            world.add(fragments)
-            world.remove(asteroid)
-            world.remove(bullet)
+            wave.asteroids.extend(fragments)
+            entities.extend(fragments)
+            asteroid.alive = False
+            wave.asteroids.remove(asteroid)
+            bullet.alive = False
+            entities.remove(bullet)
 
 
 def get_fragments(mob: Asteroid | Drone) -> list[Asteroid | Drone]:
@@ -587,94 +444,88 @@ def get_fragments(mob: Asteroid | Drone) -> list[Asteroid | Drone]:
     ]
 
 
-def collide_bullet_saucer(bullet: Bullet, world: World, **_) -> None:
+def collide_bullet_saucer(bullet: Bullet, entities: list, state: dict, **_) -> None:
     """Check for collisions between bullets and saucers."""
+    wave = state["wave"]
     if (
-        (saucer := world.wave.saucer)
+        (saucer := wave.saucer)
         and collide(bullet, saucer)
-        and bullet.source is Ship
+        and isinstance(bullet.source, Ship)
     ):
-        world.score += saucer.score
-        world.add(Explosion(saucer.pos.copy(), size=saucer.size))
-        world.remove(saucer)
-        world.remove(bullet)
+        bullet.source.score += saucer.score
+        entities.append(Explosion(saucer.pos.copy(), size=saucer.size))
+        assets[f"saucer_{saucer.size.name}"].fadeout(200)
+        saucer.alive = False
+        entities.remove(saucer)
+        wave.saucer = None
+        wave.saucer_timer.elapsed = 0
+        bullet.alive = False
+        entities.remove(bullet)
 
 
-def collide_asteroid_ship(asteroid: Asteroid, world: World, **_) -> None:
+def collide_asteroid_ship(asteroid: Asteroid, entities: list, state: dict, **_) -> None:
     """Check for collisions between asteroids and the ship."""
-    ship = world.ship
+    ship = state["ship"]
     if ship.alive and collide(ship, asteroid):
-        if ship.shield.active:
-            asteroid.velocity = asteroid.velocity.reflect(asteroid.pos - ship.pos)
-            asteroid.pos += asteroid.velocity
-        elif ship.invulnerability.finished:
-            world.add(Explosion(ship.pos.copy()))
-            world.remove(ship)
+        # if ship.shield.active:
+        #     asteroid.velocity = asteroid.velocity.reflect(asteroid.pos - ship.pos)
+        #     asteroid.pos += asteroid.velocity
+        if ship.invulnerability.finished:
+            entities.append(Explosion(ship.pos.copy()))
+            ship.alive = False
 
 
-def collide_drone_ship(drone: Drone, world: World, **_) -> None:
+def collide_drone_ship(drone: Drone, entities: list, state: dict, **_) -> None:
     """Check for collisions between drones and the ship."""
-    ship = world.ship
+    ship = state["ship"]
     if ship.alive and collide(ship, drone):
-        if ship.shield.active:
-            world.add(Explosion(drone.pos.copy(), size=drone.size))
-            world.remove(drone)
-        elif ship.invulnerability.finished:
-            world.add(Explosion(ship.pos.copy()))
-            world.remove(ship)
+        # if ship.shield.active:
+        #     entities.append(Explosion(drone.pos.copy(), size=drone.size))
+        #     drone.alive = False
+        # world.remove(drone)
+        if ship.invulnerability.finished:
+            entities.append(Explosion(ship.pos.copy()))
+            ship.alive = False
 
 
-def collide_bullet_ship(bullet: Bullet, world: World, **_) -> None:
+def collide_bullet_ship(bullet: Bullet, entities: list, state: dict, **_) -> None:
     """Check for collisions between bullets and the ship."""
-    ship = world.ship
+    ship = state["ship"]
     if (
         ship.alive
         and ship.invulnerability.finished
-        and bullet.source is not Ship
+        and bullet.source is not ship
         and collide(bullet, ship)
     ):
-        world.remove(bullet)
-        if not ship.shield.active:
-            world.add(Explosion(ship.pos.copy()))
-            world.remove(ship)
+        bullet.alive = False
+        entities.remove(bullet)
+        if ship.invulnerability.finished:  # not ship.shield.active:
+            entities.append(Explosion(ship.pos.copy()))
+            ship.alive = False
 
 
-def collide_saucer_ship(saucer: Saucer, world: World, **_) -> None:
+def collide_saucer_ship(saucer: Saucer, entities: list, state: dict, **_) -> None:
     """Check for collisions between saucers and the ship."""
-    ship = world.ship
+    ship = state["ship"]
     if collide(ship, saucer):
-        if ship.shield.active:
-            world.add(Explosion(saucer.pos.copy(), size=saucer.size))
-            world.remove(saucer)
-        else:
-            world.add(Explosion(ship.pos.copy()))
-            world.remove(ship)
+        # if ship.shield.active:
+        #     world.add(Explosion(saucer.pos.copy(), size=saucer.size))
+        #     world.remove(saucer)
+        # else:
+        if ship.invulnerability.finished:
+            entities.append(Explosion(ship.pos.copy()))
+            ship.alive = False
 
 
-def respawn_ship(ship: Ship, world: World, **_) -> None:
-    """Respawn the ship if it is dead and has lives remaining."""
-    if not ship.alive and ship.respawn_timer.finished and ship.lives > 0:
-        ship.pos.update(0.5, 0.5)
-        ship.velocity.update(0, 0)
-        ship.acceleration.update(0, 0)
-        ship.spin = 0.0
-        ship.thruster = False
-        ship.shield.active = False
-        ship.alive = True
-        ship.shield.elapsed = 0
-        ship.invulnerability.elapsed = 0
-
-
-def spawn_saucer(wave: Wave, world: World, **_) -> None:
+def spawn_saucer(wave: Wave, entities: list, **_) -> None:
     """Spawn a saucer if the timer has elapsed."""
     if not wave.saucer and wave.saucer_timer.finished:
-        wave.saucer = random.choice((Saucer, SmallSaucer))()
-        world.add(wave.saucer)
-        if not Settings.mute:
-            assets[f"saucer_{wave.saucer.size.name}"].play(loops=-1, fade_ms=100)
+        wave.saucer = Saucer(size=random.choice((Size.big, Size.small)))
+        entities.append(wave.saucer)
+        assets[f"saucer_{wave.saucer.size.name}"].play(loops=-1, fade_ms=100)
 
 
-def control_ship(ship: Ship, events: list[Event], world: World, **_) -> None:
+def control_ship(ship: Ship, events: list[Event], entities: list, **_) -> None:
     """Control the ship with keyboard input."""
     if not ship.alive:
         return
@@ -684,45 +535,43 @@ def control_ship(ship: Ship, events: list[Event], world: World, **_) -> None:
             key = event.key
             if key == pg.K_UP:
                 ship.thruster = True
-                if not Settings.mute:
-                    assets.thrust.play(loops=-1, fade_ms=100)
+                assets.thrust.play(loops=-1, fade_ms=100)
             if key == pg.K_LEFT:
                 ship.spin = -20
             if key == pg.K_RIGHT:
                 ship.spin = 20
             if key == pg.K_SPACE:
-                if not Settings.mute:
-                    assets.fire.play()
-                world.add(
+                assets.fire.play()
+                entities.append(
                     Bullet(
                         ship.pos,
+                        source=ship,
                         velocity=ship.velocity
                         + pygame.Vector2(0, Bullet.SPEED).rotate(ship.angle),
                     )
                 )
-            if key == pg.K_s:
-                ship.shield.active = True
+            # if key == pg.K_s:
+            #     ship.shield.active = True
 
         if event.type == pg.KEYUP:
             key = event.key
             if key == pg.K_UP:
                 ship.thruster = False
                 ship.acceleration = pygame.Vector2(0)
-                if not Settings.mute:
-                    assets.thrust.fadeout(200)
+                assets.thrust.fadeout(200)
             if key in (pg.K_LEFT, pg.K_RIGHT):
                 ship.spin = 0
-            if key == pg.K_s:
-                ship.shield.active = False
+            # if key == pg.K_s:
+            #     ship.shield.active = False
 
     if ship.thruster:
         ship.acceleration = Ship.THRUST_VECTOR.rotate(ship.angle)
 
 
-def steer_drone(drone: Drone, world: World, **_) -> None:
+def steer_drone(drone: Drone, state: dict, **_) -> None:
     """Steer the drone towards the ship."""
     if drone.size != Size.big:
-        angle_to_ship = 180 - angle_between(drone.pos, world.ship.pos)
+        angle_to_ship = 180 - angle_between(drone.pos, state["ship"].pos)
         drone.spin = -10 if (angle_to_ship - drone.angle) % 360 < 180 else 10
         drone.acceleration = Drone.THRUST_VECTOR.rotate(drone.angle)
         drone.velocity.clamp_magnitude_ip(drone.speed)
@@ -733,111 +582,140 @@ def steer_saucer(saucer: Saucer, **_) -> None:
     saucer.velocity.y = math.sin(math.radians(saucer.pos.x * 360 * 3)) * 0.015
 
 
-def shoot_saucer(saucer: Saucer, world: World, **_) -> None:
+def shoot_saucer(saucer: Saucer, entities: list, state: dict, **_) -> None:
     """Shoot a bullet from the saucer."""
     if saucer.firing_cooldown.finished:
         if saucer.size == Size.big:
             velocity = saucer.velocity + random_vector(Bullet.SPEED)
         else:
             # aim at ship with slight spread
-            velocity = ((world.ship.pos - saucer.pos).normalize() * 0.15).rotate(
+            velocity = ((state["ship"].pos - saucer.pos).normalize() * 0.15).rotate(
                 random.uniform(-10, 10)
             )
-        world.add(SaucerBullet(saucer.pos, velocity=velocity))
-        if not Settings.mute:
-            assets.saucer_fire.play()
+        entities.append(Bullet(saucer.pos, source=saucer, velocity=velocity))
+        assets.saucer_fire.play()
         saucer.firing_cooldown.elapsed = 0
 
 
-def start_next_wave(wave: Wave, world: World, **_) -> None:
+def start_next_wave(wave: Wave, entities: list, state: dict, **_) -> None:
     """Start the next wave when all asteroids are destroyed."""
     if wave.completed:
-        world.wave = Wave(wave.number + 1)
+        wave.number += 1
+        wave.started = False
+        wave.__post_init__()
 
     if not wave.started and wave.get_ready_cooldown.finished:
         wave.started = True
-        world.add(wave.asteroids)
+        entities.extend(wave.asteroids)
         # avoid spawning on top of ship
         for asteroid in wave.asteroids:
-            asteroid.pos += world.ship.pos
+            if collide(asteroid, state["ship"]):
+                asteroid.pos += state["ship"].pos
 
 
-def cull_bullets(bullet: Bullet, world: World, **_) -> None:
+def timeout_bullets(bullet: Bullet, entities: list, **_) -> None:
     """Remove bullets that have exceeded their time-to-live."""
-    if bullet.ttl.finished:
-        world.remove(bullet)
+    if bullet.alive and bullet.ttl.finished:
+        bullet.alive = False
+        entities.remove(bullet)
 
 
-def cull_explosions(explosion: Explosion, world: World, **_) -> None:
+def timeout_explosions(explosion: Explosion, entities: list, **_) -> None:
     """Remove explosions that have completed their animation."""
-    if explosion.timer.finished:
-        world.remove(explosion)
+    if explosion.alive and explosion.timer.finished:
+        explosion.alive = False
+        entities.remove(explosion)
 
 
-def award_extra_lives(ship: Ship, world: World, **_) -> None:
+def respawn_ship(ship: Ship, entities: list, **_) -> None:
+    """Remove the ship if destroyed."""
+    if ship.alive:
+        return
+
+    if ship.respawn_timer.paused:
+        assets.thrust.fadeout(200)
+        ship.respawn_timer.elapsed = 0
+        ship.respawn_timer.paused = False
+        ship.lives -= 1
+        return
+
+    if ship.respawn_timer.finished:
+        if ship.lives == 0:
+            entities.remove(ship)
+            return
+
+        ship.pos.update(0.5, 0.5)
+        ship.velocity.update(0, 0)
+        ship.acceleration.update(0, 0)
+        ship.spin = 0.0
+        ship.thruster = False
+        # ship.shield.active = False
+        ship.alive = True
+        ship.respawn_timer.paused = True
+        return
+
+
+def award_extra_lives(ship: Ship, state: dict, **_) -> None:
     """Award an extra life every 10,000 points."""
-    if world.score > ship.extra_life_trigger * 10000:
+    if ship.score > ship.extra_life_trigger * 10000:
         if ship.lives < 10:
             ship.lives += 1
-            if not Settings.mute:
-                assets.life.play()
+            assets.life.play()
         ship.extra_life_trigger += 1
 
 
-def play_heartbeat(ship: Ship, world: World, **_) -> None:
+def play_heartbeat(ship: Ship, **_) -> None:
     """Play the heartbeat sound effect at regular intervals."""
     if ship.heartbeat.finished:
-        if not Settings.mute:
-            assets.beat1.play()
-        ship.heartbeat.duration = 1000 + int(min(1.0, world.score / 1000000) * 750)
+        assets.beat1.play()
+        ship.heartbeat.duration = 1000 + int(min(1.0, ship.score / 1000000) * 750)
         ship.heartbeat.elapsed = 0
 
 
-def draw_mob(mob: Mob, surface: pygame.Surface) -> None:
+def draw_mob(surface: pygame.Surface, mob: Mob) -> None:
     """Draw a mob."""
-    if mob.alive:
-        to_world = Transform(translate=mob.pos, scale=mob.radius, angle=mob.angle)
+    to_world = partial(transform, translate=mob.pos, scale=mob.radius, rotate=mob.angle)
 
-        match mob:
-            case Drone(size=Size.medium) as drone:
-                offset = pygame.Vector2(0, 0.013).rotate(drone.angle)
-                front = Transform(translate=offset, scale=0.625)(drone.shape)
-                back = Transform(translate=-offset, scale=0.625, angle=180)(drone.shape)
-                draw_shape(surface, drone.color, to_world(front))
-                draw_shape(surface, drone.color, to_world(back))
+    match mob:
+        case Drone(size=Size.medium) as drone:
+            offset = pygame.Vector2(0, 0.013).rotate(drone.angle)
+            front = transform(drone.shape, translate=offset, scale=0.625)
+            back = transform(drone.shape, translate=-offset, scale=0.625, rotate=180)
+            draw_shape(surface, drone.color, to_world(front))
+            draw_shape(surface, drone.color, to_world(back))
 
-            case Drone(size=Size.big) as drone:
-                for angle in range(0, 360, 60):
-                    segment = Transform(
-                        translate=pygame.Vector2(0, 0.025).rotate(angle),
-                        scale=drone.radius * 0.5,
-                        angle=angle - (60 if angle % 120 == 0 else -60),
-                    )(drone.shape)
-                    draw_shape(surface, drone.color, Transform(mob.pos)(segment))
+        case Drone(size=Size.big) as drone:
+            for angle in range(0, 360, 60):
+                segment = transform(
+                    cast(Polygon, drone.shape),
+                    translate=pygame.Vector2(0, 0.025).rotate(angle),
+                    scale=drone.radius * 0.5,
+                    rotate=angle - (60 if angle % 120 == 0 else -60),
+                )
+                draw_shape(surface, drone.color, transform(segment, mob.pos))
 
-            case Explosion() as explosion:
-                explode = Transform(scale=explosion.anim.current_frame)
-                for i in range(3):
-                    blast_wave = explode(Circle(random.uniform(1, 1.1875)))
-                    draw_shape(surface, explosion.color, to_world(blast_wave))
+        case Explosion() as explosion:
+            explode = partial(transform, scale=explosion.radius)
+            for i in range(3):
+                blast_wave = explode(Circle(random.uniform(1, 1.1875)))
+                draw_shape(surface, explosion.color, to_world(blast_wave))
 
-            case Ship() as ship:
-                draw_shape(surface, ship.color, to_world(ship.shape))
+        case Ship() as ship:
+            draw_shape(surface, ship.color, to_world(ship.shape))
 
-                if ship.thruster:
-                    draw_shape(surface, ship.color, to_world(ship.exhaust))
+            if ship.thruster:
+                draw_shape(surface, ship.color, to_world(ship.exhaust))
 
-                if ship.shield.active:
-                    shield_shape = to_world(Circle(random.uniform(1.2, 1.3875)))
-                    draw_shape(surface, ship.shield.color, shield_shape)
+            # if ship.shield.active:
+            #     shield_shape = to_world(Circle(random.uniform(1.2, 1.3875)))
+            #     draw_shape(surface, ship.shield.color, shield_shape)
 
-            case _:
-                draw_shape(surface, mob.color, to_world(mob.shape))
+        case _:
+            draw_shape(surface, mob.color, to_world(mob.shape))
 
 
 if __name__ == "__main__":
-    Game(
-        initial_screen=MainMenu,
-        window_size=(800, 800),
-        window_title="Asteroids",
-    ).start()
+    run_game(
+        pygame.Window("Asteroids", (800, 800)),
+        asteroids(),
+    )
