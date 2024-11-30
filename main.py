@@ -11,6 +11,7 @@ from typing import cast
 
 import pygame
 import pygame.locals as pg
+from pygame import Surface
 from pygame.event import Event
 
 from pygskin import imgui
@@ -22,6 +23,7 @@ from pygskin.ecs import get_ecs_update_fn
 from pygskin.game import run_game
 from pygskin.imgui import label
 from pygskin.screen import ScreenFn
+from pygskin.screen import ScreenManager
 from pygskin.screen import screen_manager
 from pygskin.stylesheet import get_styles
 from pygskin.utils import angle_between
@@ -57,9 +59,8 @@ def asteroids():
     )
 
 
-def main_menu(window: pygame.Window, events: list[Event], state: dict) -> None:
+def main_menu(surface: Surface, events: list[Event], manager: ScreenManager) -> None:
     """The main menu screen."""
-    surface = window.get_surface()
     rect = surface.get_rect()
     surface.blit(assets.main_menu, (0, 0))
 
@@ -71,11 +72,11 @@ def main_menu(window: pygame.Window, events: list[Event], state: dict) -> None:
         )
 
     if any(event.type == pg.KEYDOWN for event in events):
-        state["start_game"] = True
+        manager.send("start_game")
 
 
-def start_game(state) -> ScreenFn | None:
-    return play_game() if state.pop("start_game", False) else None
+def start_game(input) -> ScreenFn | None:
+    return play_game() if input == "start_game" else None
 
 
 @cache
@@ -125,14 +126,12 @@ def play_game() -> ScreenFn:
 
     reset_game()
 
-    def _play_game(window: pygame.Window, events: list[Event], s: dict) -> None:
+    def _play_game(surface: Surface, events: list[Event], manager: ScreenManager) -> None:
         """The main game screen."""
-        surface = window.get_surface()
         surface.fill((0, 0, 0))
         surface.blit(assets.background, (0, 0))
         rect = surface.get_rect()
-        layer = pygame.Surface(rect.size, pygame.SRCALPHA)
-        state.setdefault("screen_manager", s["screen_manager"])
+        layer = Surface(rect.size, pygame.SRCALPHA)
 
         if any(event.type == pg.KEYDOWN and event.key == pg.K_p for event in events):
             state["paused"] = not state["paused"]
@@ -144,7 +143,7 @@ def play_game() -> ScreenFn:
         if state["game_over"] and any(event.type == pg.KEYDOWN for event in events):
             entities.clear()
             reset_game()
-            state["screen_manager"].send(state)
+            manager.send("game_over")
 
         for entity in entities:
             if isinstance(entity, Mob) and entity.alive:
@@ -165,10 +164,8 @@ def play_game() -> ScreenFn:
     return _play_game
 
 
-def return_to_main_menu(state) -> ScreenFn | None:
-    if state.get("game_over"):
-        return main_menu
-    return None
+def return_to_main_menu(input) -> ScreenFn | None:
+    return main_menu if input == "game_over" else None
 
 
 def random_vector(magnitude: float = 1.0) -> pygame.Vector2:
@@ -386,7 +383,7 @@ class Wave:
         return self.started and not self.asteroids and not self.saucer
 
 
-def draw_lives(surface: pygame.Surface, lives: int) -> None:
+def draw_lives(surface: Surface, lives: int) -> None:
     """Draw the remaining lives as ships."""
     for i in range(lives):
         ship = transform(
@@ -672,7 +669,7 @@ def play_heartbeat(ship: Ship, **_) -> None:
         ship.heartbeat.elapsed = 0
 
 
-def draw_mob(surface: pygame.Surface, mob: Mob) -> None:
+def draw_mob(surface: Surface, mob: Mob) -> None:
     """Draw a mob."""
     to_world = partial(transform, translate=mob.pos, scale=mob.radius, rotate=mob.angle)
 
