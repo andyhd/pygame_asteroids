@@ -1,5 +1,6 @@
 import math
 import random
+from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field
 from enum import IntEnum
@@ -14,19 +15,20 @@ import pygame.locals as pg
 from pygame import Surface
 from pygame.event import Event
 
-from pygskin import imgui
-from pygskin.animation import animate
-from pygskin.assets import Assets
-from pygskin.clock import Clock
-from pygskin.clock import Timer
-from pygskin.ecs import get_ecs_update_fn
-from pygskin.game import run_game
+from pygskin import (
+    imgui,
+    animate,
+    Assets,
+    Clock,
+    Timer,
+    get_ecs_update_fn,
+    run_game,
+    ScreenFn,
+    screen_manager,
+    get_styles,
+    angle_between,
+)
 from pygskin.imgui import label
-from pygskin.screen import ScreenFn
-from pygskin.screen import ScreenManager
-from pygskin.screen import screen_manager
-from pygskin.stylesheet import get_styles
-from pygskin.utils import angle_between
 
 from shapes import Circle
 from shapes import ComplexShape
@@ -59,7 +61,7 @@ def asteroids():
     )
 
 
-def main_menu(surface: Surface, events: list[Event], manager: ScreenManager) -> None:
+def main_menu(surface: Surface, events: list[Event], exit: Callable) -> None:
     """The main menu screen."""
     rect = surface.get_rect()
     surface.blit(assets.main_menu, (0, 0))
@@ -72,7 +74,7 @@ def main_menu(surface: Surface, events: list[Event], manager: ScreenManager) -> 
         )
 
     if any(event.type == pg.KEYDOWN for event in events):
-        manager.send("start_game")
+        exit("start_game")
 
 
 def start_game(input) -> ScreenFn | None:
@@ -126,7 +128,7 @@ def play_game() -> ScreenFn:
 
     reset_game()
 
-    def _play_game(surface: Surface, events: list[Event], manager: ScreenManager) -> None:
+    def _play_game(surface: Surface, events: list[Event], exit: Callable) -> None:
         """The main game screen."""
         surface.fill((0, 0, 0))
         surface.blit(assets.background, (0, 0))
@@ -143,7 +145,7 @@ def play_game() -> ScreenFn:
         if state["game_over"] and any(event.type == pg.KEYDOWN for event in events):
             entities.clear()
             reset_game()
-            manager.send("game_over")
+            exit("game_over")
 
         for entity in entities:
             if isinstance(entity, Mob) and entity.alive:
